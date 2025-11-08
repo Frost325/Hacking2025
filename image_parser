@@ -1,0 +1,27 @@
+import cv2
+import pytesseract
+import numpy as np
+from PIL import Image
+
+# If needed on Windows: specify path to tesseract.exe:
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+def extract_text(image_path):
+    # Load and grayscale
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Threshold to isolate handwriting
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # (Optional) remove noise
+    kernel = np.ones((3,3), np.uint8)
+    clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+
+    # Use Tesseract OCR on the cleaned image
+    text = pytesseract.image_to_string(clean, config="--psm 6")
+    # PSM 6 = Assume a block of text
+
+    return text.strip()
+
+print(extract_text("Untitled.jpg"))
