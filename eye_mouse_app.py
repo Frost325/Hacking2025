@@ -3,11 +3,11 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import pyautogui
-import keyboard  # <--- used for Q toggle
+import keyboard   # For Q toggle
 from PyQt6.QtWidgets import QApplication, QWidget, QPushButton, QVBoxLayout, QLabel
 from PyQt6.QtCore import QThread, pyqtSignal
 
-SMOOTHING_ALPHA = 0.2
+SMOOTHING_ALPHA = 0.25
 
 class EyeTrackerThread(QThread):
     status = pyqtSignal(str)
@@ -19,8 +19,10 @@ class EyeTrackerThread(QThread):
         self.calibrated = False
         self.T = None
         self.prev_smoothed = None
+        self.blink_flag = False
 
         self.screen_w, self.screen_h = pyautogui.size()
+
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             max_num_faces=1,
@@ -28,17 +30,25 @@ class EyeTrackerThread(QThread):
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         )
+
         self.cap = None
 
-    def iris_center(self, landmarks):
+    def relative_eye_position(self, lm):
         LEFT_IRIS = [474, 475, 476, 477]
         RIGHT_IRIS = [469, 470, 471, 472]
-        pts = []
-        for group in (LEFT_IRIS, RIGHT_IRIS):
-            xs = [landmarks[i].x for i in group]
-            ys = [landmarks[i].y for i in group]
-            pts.append((np.mean(xs), np.mean(ys)))
-        return np.array([(pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2])
+
+        ix = np.mean([lm[i].x for i in LEFT_IRIS + RIGHT_IRIS])
+        iy = np.mean([lm[i].y for i in LEFT_IRIS + RIGHT_IRIS])
+
+        eye_left = lm[33].x
+        eye_right = lm[133].x
+        eye_top = lm[159].y
+        eye_bottom = lm[145].y
+
+        nx = (ix - eye_left) / (eye_right - eye_left)
+        ny = (iy - eye_top) / (eye_bottom - eye_top)
+
+        return np.array([nx, ny])
 
     def map_to_screen(self, norm_xy):
         v = np.array([norm_xy[0], norm_xy[1], 1.0])
@@ -47,65 +57,93 @@ class EyeTrackerThread(QThread):
         scr[1] = np.clip(scr[1], 0, self.screen_h-1)
         return scr.astype(int)
 
+    def eye_aspect_ratio(self, lm, left=True):
+        if left:
+            top = lm[159]; bottom = lm[145]
+            left_pt = lm[33]; right_pt = lm[133]
+        else:
+            top = lm[386]; bottom = lm[374]
+            left_pt = lm[362]; right_pt = lm[263]
+
+        v = np.linalg.norm([top.x-bottom.x, top.y-bottom.y])
+        h = np.linalg.norm([left_pt.x-right_pt.x, left_pt.y-right_pt.y])
+        return v / h
+
     def calibrate(self):
         if self.cap is None or not self.cap.isOpened():
             self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-            if not self.cap.isOpened():
-                self.status.emit("Error: Start camera first.")
-                return
 
-        self.status.emit("Calibration: Look, then press SPACE on each point.")
+        self.status.emit("Calibration: Look at each green dot and press SPACE.")
+
         CAP_POINTS = [
-            ("top-left",   (0.1, 0.1)),
-            ("top-right",  (0.9, 0.1)),
-            ("bottom-left",(0.1, 0.9)),
-            ("bottom-right",(0.9, 0.9)),
-            ("center",     (0.5, 0.5)),
+            ("top-left", (0.1, 0.1)),
+            ("top-right", (0.9, 0.1)),
+            ("bottom-left", (0.1, 0.9)),
+            ("bottom-right", (0.9, 0.9)),
+            ("center", (0.5, 0.5)),
         ]
+
         cam_pts, scr_pts = [], []
 
         for name, (nx, ny) in CAP_POINTS:
-            self.status.emit(f"Look at: {name}, press SPACE")
+            self.status.emit(f"Look at {name}, press SPACE")
             while True:
                 ret, frame = self.cap.read()
                 if not ret:
                     continue
                 h, w = frame.shape[:2]
-                cv2.circle(frame, (int(nx*w), int(ny*h)), 20, (0,255,0), 2)
+
+                # >>>>>>> ADD HEAD POSITION BOX <<<<<<<<
+                box_w = int(w * 0.45)
+                box_h = int(h * 0.45)
+                x1 = w//2 - box_w//2
+                y1 = h//2 - box_h//2
+                x2 = w//2 + box_w//2
+                y2 = h//2 + box_h//2
+                cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+                cv2.putText(frame, "Keep your head centered in box",
+                            (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+                # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+                # Dot to look at
+                cv2.circle(frame, (int(nx*w), int(ny*h)), 18, (0,255,0), 2)
+
                 cv2.imshow("Calibration", frame)
+
                 k = cv2.waitKey(1) & 0xFF
                 if k == ord(' '):
                     res = self.face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     if res.multi_face_landmarks:
-                        ic = self.iris_center(res.multi_face_landmarks[0].landmark)
-                        cam_pts.append(ic)
+                        lm = res.multi_face_landmarks[0].landmark
+                        cam_pts.append(self.relative_eye_position(lm))
                         scr_pts.append(np.array([nx*self.screen_w, ny*self.screen_h]))
                         break
                 elif k == ord('q'):
                     cv2.destroyWindow("Calibration")
                     return
+
         cv2.destroyWindow("Calibration")
 
         src = np.array(cam_pts)
         dst = np.array(scr_pts)
-        A = np.hstack([src, np.ones((src.shape[0],1))])
+        A = np.hstack([src, np.ones((len(src),1))])
         self.T, _, _, _ = np.linalg.lstsq(A, dst, rcond=None)
+
         self.calibrated = True
         self.status.emit("Calibration complete.")
 
     def run(self):
         self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-        if self.cap.isOpened():
-            self.status.emit("Camera on.")
-        else:
+        if not self.cap.isOpened():
             self.status.emit("Camera failed.")
             return
+        self.status.emit("Camera on.")
 
         while self.running:
-            # Q toggles tracking OFF (does NOT exit app)
             if keyboard.is_pressed('q'):
-                self.tracking = False
-                self.status.emit("Tracking OFF (Q pressed)")
+                if self.tracking:
+                    self.tracking = False
+                    self.status.emit("Tracking OFF (Q pressed)")
 
             ret, frame = self.cap.read()
             if not ret:
@@ -114,20 +152,31 @@ class EyeTrackerThread(QThread):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.face_mesh.process(rgb)
 
-            if results.multi_face_landmarks and self.calibrated and self.tracking:
-                ic = self.iris_center(results.multi_face_landmarks[0].landmark)
-                screen_xy = self.map_to_screen(ic)
+            if results.multi_face_landmarks and self.calibrated:
+                lm = results.multi_face_landmarks[0].landmark
 
-                if self.prev_smoothed is None:
-                    self.prev_smoothed = screen_xy.astype(float)
+                # Blink → click
+                ear = (self.eye_aspect_ratio(lm, True) + self.eye_aspect_ratio(lm, False)) / 2
+                if ear < 0.21:
+                    if not self.blink_flag:
+                        self.blink_flag = True
+                        pyautogui.click()
                 else:
-                    self.prev_smoothed = SMOOTHING_ALPHA * screen_xy + (1-SMOOTHING_ALPHA)*self.prev_smoothed
+                    self.blink_flag = False
 
-                pyautogui.moveTo(int(self.prev_smoothed[0]), int(self.prev_smoothed[1]), duration=0)
+                if self.tracking:
+                    gaze = self.relative_eye_position(lm)
+                    screen_xy = self.map_to_screen(gaze)
+
+                    if self.prev_smoothed is None:
+                        self.prev_smoothed = screen_xy.astype(float)
+                    else:
+                        self.prev_smoothed = SMOOTHING_ALPHA*screen_xy + (1-SMOOTHING_ALPHA)*self.prev_smoothed
+
+                    pyautogui.moveTo(int(self.prev_smoothed[0]), int(self.prev_smoothed[1]), duration=0)
 
         if self.cap.isOpened():
             self.cap.release()
-
         self.status.emit("Camera stopped.")
 
     def stop_thread(self):
@@ -142,7 +191,7 @@ class App(QWidget):
 
         self.label = QLabel("Status: Idle")
         btn_calib = QPushButton("Calibrate")
-        btn_track = QPushButton("Start Tracking")
+        btn_track = QPushButton("Start / Stop Tracking")
 
         btn_calib.clicked.connect(self.tracker.calibrate)
         btn_track.clicked.connect(self.toggle_tracking)
@@ -153,9 +202,9 @@ class App(QWidget):
         layout.addWidget(btn_track)
         self.setLayout(layout)
 
-        self.tracker.status.connect(lambda msg: self.label.setText("Status: " + msg))
+        self.tracker.status.connect(lambda m: self.label.setText("Status: " + m))
 
-        self.setWindowTitle("Eye Control Minimal UI")
+        self.setWindowTitle("Eye Control UI")
         self.setFixedSize(300, 150)
 
     def toggle_tracking(self):
