@@ -109,7 +109,7 @@ class MainMenu(QWidget):
         mode_files = {
             "DRAWING": "draw_mode.py",
             "MOUSE": "mouse_mode.py",
-            "GESTURE": "gesture_mode.py"
+            "GESTURE": "emote_mode.py"
         }
         
         if mode in mode_files:
